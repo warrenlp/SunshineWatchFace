@@ -33,12 +33,25 @@ import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.support.wearable.watchface.CanvasWatchFaceService;
 import android.support.wearable.watchface.WatchFaceStyle;
 import android.text.format.DateFormat;
 import android.text.format.Time;
+import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.WindowInsets;
+
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.api.GoogleApiClient;
+import com.google.android.gms.wearable.DataApi;
+import com.google.android.gms.wearable.DataEvent;
+import com.google.android.gms.wearable.DataEventBuffer;
+import com.google.android.gms.wearable.DataItem;
+import com.google.android.gms.wearable.DataMap;
+import com.google.android.gms.wearable.DataMapItem;
+import com.google.android.gms.wearable.Wearable;
 
 import java.lang.ref.WeakReference;
 import java.text.SimpleDateFormat;
@@ -53,6 +66,8 @@ import java.util.concurrent.TimeUnit;
  * low-bit ambient mode, the text is drawn without anti-aliasing in ambient mode.
  */
 public class SunshineWatchFace extends CanvasWatchFaceService {
+    private static final String TAG = "SunshineWatchFace";
+
     private static final Typeface NORMAL_TYPEFACE =
             Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL);
 
@@ -66,6 +81,15 @@ public class SunshineWatchFace extends CanvasWatchFaceService {
      * Handler message id for updating the time periodically in interactive mode.
      */
     private static final int MSG_UPDATE_TIME = 0;
+
+    // It would be useful to not have hard-coded values here but instead to use an api that can
+    // pull the actual sunrise and sunset times for a given time-zone and latitude.
+    // https://github.com/mikereedell/sunrisesunsetlib-java
+    private static final float END_TIME = 21.5f;
+    private static final float START_TIME = 7f;
+    private static final float HIGH_ANGLE = 200f;
+    private static final float LOW_ANGLE = -20f;
+    private static final float DRAWN_RADIUS = 110f;
 
     @Override
     public Engine onCreateEngine() {
@@ -92,12 +116,15 @@ public class SunshineWatchFace extends CanvasWatchFaceService {
         }
     }
 
-    private class Engine extends CanvasWatchFaceService.Engine {
+    private class Engine extends CanvasWatchFaceService.Engine implements DataApi.DataListener,
+            GoogleApiClient.ConnectionCallbacks, GoogleApiClient.OnConnectionFailedListener {
         final Handler mUpdateTimeHandler = new EngineHandler(this);
         boolean mRegisteredTimeZoneReceiver = false;
         Paint mBackgroundPaint;
         Paint mBackgroundGroundPaint;
         private Bitmap mWeatherBitmap;
+        private String mHighTemp = SunshineWatchFaceUtil.STRING_VALUE_DEFAULT_TEMPERATURE;
+        private String mLowTemp = SunshineWatchFaceUtil.STRING_VALUE_DEFAULT_TEMPERATURE;
         Paint mTextPaint;
         Paint mDatePaint;
         Paint mTemperaturePaint;
@@ -110,6 +137,13 @@ public class SunshineWatchFace extends CanvasWatchFaceService {
                 mTime.setToNow();
             }
         };
+
+        GoogleApiClient mGoogleApiClient = new GoogleApiClient.Builder(SunshineWatchFace.this)
+                .addConnectionCallbacks(this)
+                .addOnConnectionFailedListener(this)
+                .addApi(Wearable.API)
+                .build();
+
         int mTapCount;
 
         Calendar mCalendar;
@@ -160,7 +194,8 @@ public class SunshineWatchFace extends CanvasWatchFaceService {
             mDatePaint = createTextPaint(mDigitalDateColor);
             mTemperaturePaint = createTextPaint(mTemperatureColor);
 
-            mWeatherBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.art_clear);
+            mWeatherBitmap = BitmapFactory.decodeResource(getResources(),
+                    SunshineWatchFaceUtil.WeatherBitmap.getDefaultID());
             mWeatherBitmap = Bitmap.createScaledBitmap(mWeatherBitmap,
                     (int) (mWeatherBitmap.getWidth() * 0.5),
                     (int) (mWeatherBitmap.getHeight() * 0.5), true);
@@ -292,13 +327,56 @@ public class SunshineWatchFace extends CanvasWatchFaceService {
                     break;
                 case TAP_TYPE_TAP:
                     // The user has completed the tap gesture.
+                    setInteractiveWeatherImage(mTapCount);
                     mTapCount++;
-                    mBackgroundPaint.setColor(mTapCount % 2 == 0 ?
-                            mInteractiveBackgroundColor : resources.getColor(R.color.background2));
-//                            R.color.background : R.color.background2));
+                    if (mTapCount == SunshineWatchFaceUtil.WeatherBitmap.values().length) {
+                        mTapCount = 0;
+                    }
                     break;
             }
             invalidate();
+        }
+
+        private void setInteractiveWeatherImage(int imageId) {
+            if (!isInAmbientMode()) {
+                SunshineWatchFaceUtil.WeatherBitmap weatherBitmap = null;
+
+                for (SunshineWatchFaceUtil.WeatherBitmap wbmap : SunshineWatchFaceUtil.WeatherBitmap.values()) {
+                    if (imageId == wbmap.value) {
+                        weatherBitmap = wbmap;
+                        break;
+                    }
+                }
+
+                if (weatherBitmap != null) {
+                    mWeatherBitmap = BitmapFactory.decodeResource(getResources(), weatherBitmap.id);
+                    mWeatherBitmap = Bitmap.createScaledBitmap(mWeatherBitmap,
+                            (int) (mWeatherBitmap.getWidth() * 0.5),
+                            (int) (mWeatherBitmap.getHeight() * 0.5), true);
+                }
+            }
+        }
+
+        private void setInteractiveHighTemperature(int temp) {
+            if (!isInAmbientMode()) {
+                if (temp <= SunshineWatchFaceUtil.INT_VALUE_DEFAULT_TEMPERATURE) {
+                    mHighTemp = SunshineWatchFaceUtil.STRING_VALUE_DEFAULT_TEMPERATURE;
+                } else {
+                    // Temps are stored as a whole integer and need conversion to shifted double
+                    mHighTemp = SunshineWatchFaceUtil.formatTemperature(SunshineWatchFace.this, (double)temp * 0.1);
+                }
+            }
+        }
+
+        private void setInteractiveLowTemperature(int temp) {
+            if (!isInAmbientMode()) {
+                if (temp <= SunshineWatchFaceUtil.INT_VALUE_DEFAULT_TEMPERATURE) {
+                    mLowTemp = SunshineWatchFaceUtil.STRING_VALUE_DEFAULT_TEMPERATURE;
+                } else {
+                    // Temps are stored as a whole integer and need conversion to shifted double
+                    mLowTemp = SunshineWatchFaceUtil.formatTemperature(SunshineWatchFace.this, (double)temp * 0.1);
+                }
+            }
         }
 
         @Override
@@ -325,9 +403,7 @@ public class SunshineWatchFace extends CanvasWatchFaceService {
             }
 
             // Draw the Temperature
-            String temperature = SunshineWatchFaceUtil.formatTemperature(SunshineWatchFace.this, (double) 25) +
-                    " " +
-                    SunshineWatchFaceUtil.formatTemperature(SunshineWatchFace.this, (double) 16);
+            String temperature = mHighTemp + " " + mLowTemp;
             float halfTempX = mTemperaturePaint.measureText(temperature) * 0.5f;
             canvas.drawText(temperature, xCenter-halfTempX, yCenter - mHorizonOffset, mTemperaturePaint);
 
@@ -353,24 +429,18 @@ public class SunshineWatchFace extends CanvasWatchFaceService {
         }
 
         private void drawWeatherImage(Canvas canvas, Rect bounds) {
-            float mLowTime = 7f;
-            float mHighTime = 21.5f;
-            float mHighAngle = 200f;
-            float mLowAngle = -20f;
-
             float fractionalHours = (float)mTime.hour + (float)mTime.minute/60f + (float)mTime.second/3600f;
 
-            if (mLowTime < fractionalHours && fractionalHours < mHighTime) {
-                float percentRange = (mHighTime - fractionalHours) / (mHighTime - mLowTime);
-                float drawnAngleRatio = percentRange * (mHighAngle - mLowAngle) + mLowAngle;
+            if (START_TIME < fractionalHours && fractionalHours < END_TIME) {
+                float percentRange = (END_TIME - fractionalHours) / (END_TIME - START_TIME);
+                float drawnAngleRatio = percentRange * (HIGH_ANGLE - LOW_ANGLE) + LOW_ANGLE;
                 float drawnAngleRadians = drawnAngleRatio * (float) Math.PI / 180f;
 
                 int xCenter = bounds.centerX() - mWeatherBitmap.getWidth() / 2;
                 int yCenter = bounds.centerY() - mWeatherBitmap.getHeight() / 2;
 
-                float radius = 110f;
-                int xWeatherPos = (int) (radius * (float) Math.cos(drawnAngleRadians) + xCenter);
-                int yWeatherPos = (int) (-1 * radius * (float) Math.sin(drawnAngleRadians) + yCenter);
+                int xWeatherPos = (int) (DRAWN_RADIUS * (float) Math.cos(drawnAngleRadians) + xCenter);
+                int yWeatherPos = (int) (-1 * DRAWN_RADIUS * (float) Math.sin(drawnAngleRadians) + yCenter);
                 canvas.drawBitmap(mWeatherBitmap, xWeatherPos, yWeatherPos, mBackgroundPaint);
             }
         }
@@ -404,6 +474,123 @@ public class SunshineWatchFace extends CanvasWatchFaceService {
                 long delayMs = INTERACTIVE_UPDATE_RATE_MS
                         - (timeMs % INTERACTIVE_UPDATE_RATE_MS);
                 mUpdateTimeHandler.sendEmptyMessageDelayed(MSG_UPDATE_TIME, delayMs);
+            }
+        }
+
+        private void updateConfigDataItemAndUiOnStartup() {
+            SunshineWatchFaceUtil.fetchConfigDataMap(mGoogleApiClient,
+                    new SunshineWatchFaceUtil.FetchConfigDataMapCallback() {
+                        @Override
+                        public void onConfigDataMapFetched(DataMap startupConfig) {
+                            // If the DataItem hasn't been created yet or some keys are missing,
+                            // use the default values.
+                            setDefaultValuesForMissingConfigKeys(startupConfig);
+                            // TODO: Do we need this??? We just got the config map, so why are we sending it right back?
+//                            SunshineWatchFaceUtil.putConfigDataItem(mGoogleApiClient, startupConfig);
+
+                            updateUiForConfigDataMap(startupConfig);
+                        }
+                    }
+            );
+        }
+
+        private void setDefaultValuesForMissingConfigKeys(DataMap config) {
+            addIntKeyIfMissing(config, SunshineWatchFaceUtil.KEY_WEATHER_IMAGE,
+                    SunshineWatchFaceUtil.WeatherBitmap.getDefaultValue());
+            addIntKeyIfMissing(config, SunshineWatchFaceUtil.KEY_HIGH_TEMP,
+                    SunshineWatchFaceUtil.INT_VALUE_DEFAULT_TEMPERATURE);
+            addIntKeyIfMissing(config, SunshineWatchFaceUtil.KEY_LOW_TEMP,
+                    SunshineWatchFaceUtil.INT_VALUE_DEFAULT_TEMPERATURE);
+        }
+
+        private void addIntKeyIfMissing(DataMap config, String key, int value) {
+            if (!config.containsKey(key)) {
+                config.putInt(key, value);
+            }
+        }
+
+        @Override // DataApi.DataListener
+        public void onDataChanged(DataEventBuffer dataEventBuffer) {
+            for (DataEvent dataEvent : dataEventBuffer) {
+                if (dataEvent.getType() != DataEvent.TYPE_CHANGED) {
+                    continue;
+                }
+
+                DataItem dataItem = dataEvent.getDataItem();
+                if (!dataItem.getUri().getPath().equals(
+                        SunshineWatchFaceUtil.SUNSHINE_PATH_FEATURE)) {
+                    continue;
+                }
+
+                DataMapItem dataMapItem = DataMapItem.fromDataItem(dataItem);
+                DataMap config = dataMapItem.getDataMap();
+                if (Log.isLoggable(TAG, Log.DEBUG)) {
+                    Log.d(TAG, "Config DataItem updated:" + config);
+                }
+                updateUiForConfigDataMap(config);
+            }
+        }
+
+        private void updateUiForConfigDataMap(final DataMap config) {
+            boolean uiUpdated = false;
+            for (String configKey : config.keySet()) {
+                if (!config.containsKey(configKey)) {
+                    continue;
+                }
+                int keyId = config.getInt(configKey);
+                if (Log.isLoggable(TAG, Log.DEBUG)) {
+                    Log.d(TAG, "Found Sunshine config key: " + configKey + " -> "
+                            + Integer.toHexString(keyId));
+                }
+                if (updateUiForKey(configKey, keyId)) {
+                    uiUpdated = true;
+                }
+            }
+            if (uiUpdated) {
+                invalidate();
+            }
+        }
+
+        /**
+         * Updates the weather image or temperatures of a UI item according to the given {@code configKey}. Does nothing if
+         * {@code configKey} isn't recognized.
+         *
+         * @return whether UI has been updated
+         */
+        private boolean updateUiForKey(String configKey, int keyId) {
+            if (configKey.equals(SunshineWatchFaceUtil.KEY_WEATHER_IMAGE)) {
+                setInteractiveWeatherImage(keyId);
+            } else if (configKey.equals(SunshineWatchFaceUtil.KEY_HIGH_TEMP)) {
+                setInteractiveHighTemperature(keyId);
+            } else if (configKey.equals(SunshineWatchFaceUtil.KEY_LOW_TEMP)) {
+                setInteractiveLowTemperature(keyId);
+            } else {
+                Log.w(TAG, "Ignoring unknown config key: " + configKey);
+                return false;
+            }
+            return true;
+        }
+
+        @Override // GoogleApiClient.ConnectionCallbacks
+        public void onConnected(@Nullable Bundle connectionHint) {
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "onConnected: " + connectionHint);
+            }
+            Wearable.DataApi.addListener(mGoogleApiClient, Engine.this);
+            updateConfigDataItemAndUiOnStartup();
+        }
+
+        @Override  // GoogleApiClient.ConnectionCallbacks
+        public void onConnectionSuspended(int cause) {
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "onConnectionSuspended: " + cause);
+            }
+        }
+
+        @Override  // GoogleApiClient.OnConnectionFailedListener
+        public void onConnectionFailed(@NonNull ConnectionResult connectionResult) {
+            if (Log.isLoggable(TAG, Log.DEBUG)) {
+                Log.d(TAG, "onConnectionFailed: " + connectionResult);
             }
         }
     }
